@@ -720,19 +720,6 @@ class MainActivity : ComponentActivity() {
                 showPlayStoreAnnouncement = true
                 return@LaunchedEffect
             }
-
-            announcementService.fetchPlayStoreAnnouncement()
-                .onSuccess { remoteConfig ->
-                    val resolvedAnnouncement = remoteConfig.toUiModel(this@MainActivity)
-                    playStoreAnnouncement = resolvedAnnouncement
-                    showPlayStoreAnnouncement = resolvedAnnouncement.enabled
-                }
-                .onFailure { throwable ->
-                    LogUtils.w(
-                        this@MainActivity,
-                        "Remote announcement unavailable. Keeping popup disabled. ${throwable.message ?: ""}",
-                    )
-                }
         }
 
         LaunchedEffect(userPreferencesRepository) {
