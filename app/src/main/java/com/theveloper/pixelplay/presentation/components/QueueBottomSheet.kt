@@ -124,7 +124,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
@@ -150,7 +149,6 @@ import com.theveloper.pixelplay.presentation.viewmodel.PlayerUiState
 import com.theveloper.pixelplay.presentation.viewmodel.PlayerViewModel
 import com.theveloper.pixelplay.presentation.viewmodel.PlaylistViewModel
 import com.theveloper.pixelplay.presentation.viewmodel.SettingsViewModel
-import com.theveloper.pixelplay.presentation.viewmodel.StablePlayerState
 import com.theveloper.pixelplay.presentation.utils.LocalAppHapticsConfig
 import com.theveloper.pixelplay.presentation.utils.performAppCompatHapticFeedback
 import com.theveloper.pixelplay.ui.theme.GoogleSansRounded
@@ -175,6 +173,7 @@ import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material3.Button
 import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -191,6 +190,7 @@ import kotlinx.coroutines.flow.map
 import java.util.RandomAccess
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import kotlin.math.abs
 
 private data class QueueUndoBarProjection(
     val isVisible: Boolean = false,
@@ -216,6 +216,8 @@ fun QueueBottomSheet(
     currentQueueSourceName: String,
     currentSongId: String?,
     currentMediaItemIndex: Int = -1,
+    isVisible: Boolean,
+    isPlaying: Boolean,
     repeatMode: Int,
     isShuffleOn: Boolean,
     onDismiss: () -> Unit,
@@ -254,19 +256,17 @@ fun QueueBottomSheet(
     var showClearQueueDialog by remember { mutableStateOf(false) }
     var isFabExpanded by rememberSaveable { mutableStateOf(false) }
 
-    BackHandler(enabled = isFabExpanded) {
+    LaunchedEffect(isVisible) {
+        if (!isVisible) {
+            showTimerOptions = false
+            showClearQueueDialog = false
+            isFabExpanded = false
+        }
+    }
+
+    BackHandler(enabled = isVisible && isFabExpanded) {
         isFabExpanded = false
     }
-
-    val infrequentPlayerState by viewModel.stablePlayerState.collectAsStateWithLifecycle()
-
-    val albumColorSchemePair by viewModel.currentAlbumArtColorSchemePair.collectAsStateWithLifecycle()
-    val isDark = isSystemInDarkTheme()
-    val albumColorScheme = remember(albumColorSchemePair, isDark) {
-        albumColorSchemePair?.let { pair -> if (isDark) pair.dark else pair.light }
-    }
-
-    val isPlaying = infrequentPlayerState.isPlaying
 
     // Use the real player index from MediaController if available to resolve duplicates.
     // Fall back to ID search only if index is invalid (-1).
@@ -303,6 +303,7 @@ fun QueueBottomSheet(
     }
 
     val listState = rememberLazyListState()
+    val queueCoroutineScope = rememberCoroutineScope()
     val displaySongCount = displaySongs.size
 
     // Local order used only while previewing a drag reorder.
@@ -313,9 +314,10 @@ fun QueueBottomSheet(
     var pendingReorderGraceUpdates by remember { mutableIntStateOf(0) }
 
     // Stable keys for queue rows to prevent state recycling glitches on remove/reorder.
-    var committedDisplaySongIds by remember { mutableStateOf(displaySongs.map { it.id }) }
-    var committedDisplayKeys by remember { mutableStateOf(List(displaySongCount) { it.toLong() }) }
-    var nextStableQueueItemKey by remember { mutableLongStateOf(displaySongCount.toLong()) }
+    // Start empty so opening the sheet does not eagerly allocate IDs/keys for the entire queue.
+    var committedDisplaySongIds by remember { mutableStateOf<List<String>>(emptyList()) }
+    var committedDisplayKeys by remember { mutableStateOf<List<Long>>(emptyList()) }
+    var nextStableQueueItemKey by remember { mutableLongStateOf(0L) }
 
     // Track queue order by content (not list identity) to avoid clearing preview
     // when upstream emits equivalent list instances during drag.
@@ -323,21 +325,36 @@ fun QueueBottomSheet(
     val displaySongsSignature = remember(displaySongs, queueIndexOffset) {
         (queueIndexOffset * 31) + System.identityHashCode(displaySongs)
     }
-    val defaultDisplayOrder = remember(displaySongCount, queueIndexOffset) {
-        List(displaySongCount) { queueIndexOffset + it }
-    }
-    val defaultDisplayKeys = remember(displaySongCount, queueIndexOffset) {
-        List(displaySongCount) { (queueIndexOffset + it).toLong() }
-    }
-    val activeOrder = reorderPreviewOrder ?: defaultDisplayOrder
     val activeKeys = reorderPreviewKeys
         ?: committedDisplayKeys.takeIf { it.size == displaySongCount }
-        ?: defaultDisplayKeys
     val activeSongSource = reorderPreviewBaseQueue ?: queue
-    val activeKeyToLocalIndex = remember(activeKeys) {
-        HashMap<Long, Int>(activeKeys.size).apply {
-            activeKeys.forEachIndexed { index, stableKey ->
-                put(stableKey, index)
+    fun activeQueueIndexAt(index: Int): Int =
+        reorderPreviewOrder?.getOrNull(index) ?: (queueIndexOffset + index)
+
+    fun activeKeyAt(index: Int): Long =
+        activeKeys?.getOrNull(index) ?: (queueIndexOffset + index).toLong()
+
+    // --- REORDER STATE ---
+    var lastMovedFrom by remember { mutableStateOf<Int?>(null) }
+    var lastMovedTo by remember { mutableStateOf<Int?>(null) }
+    var reorderHandleInUse by remember { mutableStateOf(false) }
+    val updatedReorderHandleInUse by rememberUpdatedState(reorderHandleInUse)
+
+    val shouldMapActiveKeys = reorderHandleInUse || reorderPreviewOrder != null
+    val activeKeyToLocalIndex = remember(
+        activeKeys,
+        displaySongCount,
+        queueIndexOffset,
+        shouldMapActiveKeys
+    ) {
+        if (!shouldMapActiveKeys) {
+            emptyMap()
+        } else {
+            HashMap<Long, Int>(displaySongCount).apply {
+                for (index in 0 until displaySongCount) {
+                    val stableKey = activeKeys?.getOrNull(index) ?: (queueIndexOffset + index).toLong()
+                    put(stableKey, index)
+                }
             }
         }
     }
@@ -370,6 +387,9 @@ fun QueueBottomSheet(
         }
 
         var nextKey = nextStableQueueItemKey
+        if (committedDisplaySongIds.isEmpty() && committedDisplayKeys.isEmpty()) {
+            nextKey = queueIndexOffset.toLong()
+        }
         val newKeys = ArrayList<Long>(newSongs.size)
         newSongs.forEach { song ->
             val bucket = reusableKeysBySongId[song.id]
@@ -433,15 +453,14 @@ fun QueueBottomSheet(
         reorderPreviewQueueSignature = displaySongsSignature
     }
 
-    // --- REORDER STATE ---
-    var lastMovedFrom by remember { mutableStateOf<Int?>(null) }
-    var lastMovedTo by remember { mutableStateOf<Int?>(null) }
-    var reorderHandleInUse by remember { mutableStateOf(false) }
-    val updatedReorderHandleInUse by rememberUpdatedState(reorderHandleInUse)
-
     fun mapKeyToLocalIndex(key: Any?, keyToLocalIndex: Map<Long, Int>): Int? {
         val stableKey = key as? Long ?: return null
-        return keyToLocalIndex[stableKey]
+        keyToLocalIndex[stableKey]?.let { return it }
+        activeKeys?.let { keys ->
+            return keys.indexOf(stableKey).takeIf { it >= 0 }
+        }
+        val defaultIndex = (stableKey - queueIndexOffset).toInt()
+        return defaultIndex.takeIf { it in 0 until displaySongCount }
     }
 
     val reorderableState = rememberReorderableLazyListState(
@@ -450,8 +469,10 @@ fun QueueBottomSheet(
             if (reorderPreviewOrder == null) {
                 reorderPreviewBaseQueue = queue
             }
-            val currentOrder = activeOrder
-            val currentKeys = activeKeys
+            val currentOrder = reorderPreviewOrder
+                ?: List(displaySongCount) { queueIndexOffset + it }
+            val currentKeys = reorderPreviewKeys
+                ?: List(displaySongCount) { activeKeyAt(it) }
 
             val fromLocalIndex = mapKeyToLocalIndex(from.key, activeKeyToLocalIndex) ?: return@rememberReorderableLazyListState
             val toLocalIndex = mapKeyToLocalIndex(to.key, activeKeyToLocalIndex) ?: return@rememberReorderableLazyListState
@@ -707,7 +728,18 @@ fun QueueBottomSheet(
                     onPrevious = { viewModel.previousSong() },
                     onPlayPause = { viewModel.playPause() },
                     onNext = { viewModel.nextSong() },
-                    colorScheme = albumColorScheme,
+                    onLocateCurrentSong = {
+                        if (currentSongDisplayIndex in 0..<displaySongCount) {
+                            queueCoroutineScope.launch {
+                                val firstVisible = listState.firstVisibleItemIndex
+                                if (abs(currentSongDisplayIndex - firstVisible) > 20) {
+                                    listState.scrollToItem(currentSongDisplayIndex)
+                                } else {
+                                    listState.animateScrollToItem(currentSongDisplayIndex)
+                                }
+                            }
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .then(directSheetDragModifier)
@@ -761,13 +793,12 @@ fun QueueBottomSheet(
 
                             items(
                                 count = displaySongCount,
-                                key = { index -> activeKeys[index] },
+                                key = { index -> activeKeyAt(index) },
                                 contentType = { "queue_song" }
                             ) { index ->
-                                if (index >= activeOrder.size || index >= activeKeys.size) return@items
-                                val queueIndex = activeOrder[index]
+                                val queueIndex = activeQueueIndexAt(index)
                                 if (queueIndex !in activeSongSource.indices) return@items
-                                val itemStableKey = activeKeys[index]
+                                val itemStableKey = activeKeyAt(index)
                                 val song = activeSongSource[queueIndex]
                                 val canReorder = index > currentSongDisplayIndex
                                 ReorderableItem(
@@ -979,6 +1010,25 @@ fun QueueBottomSheet(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
+                            if (currentSongDisplayIndex >= 0 && currentSongDisplayIndex < displaySongCount) {
+                                QueueToolbarMenuButton(
+                                    text = stringResource(R.string.presentation_batch_e_action_locate_current_song),
+                                    icon = Icons.Rounded.MyLocation,
+                                    containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                                    contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                                    onClick = {
+                                        isFabExpanded = false
+                                        queueCoroutineScope.launch {
+                                            val firstVisible = listState.firstVisibleItemIndex
+                                            if (Math.abs(currentSongDisplayIndex - firstVisible) > 20) {
+                                                listState.scrollToItem(currentSongDisplayIndex)
+                                            } else {
+                                                listState.animateScrollToItem(currentSongDisplayIndex)
+                                            }
+                                        }
+                                    }
+                                )
+                            }
                             QueueToolbarMenuButton(
                                 text = stringResource(R.string.presentation_batch_e_action_clear_queue),
                                 icon = Icons.Filled.ClearAll,
@@ -1109,14 +1159,14 @@ fun QueueBottomSheet(
                             showClearQueueDialog = false
                         }
                     ) {
-                        Text(stringResource(R.string.presentation_batch_b_clear))
+                        Text(stringResource(R.string.presentation_batch_b_clear), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 },
                 dismissButton = {
                     TextButton(
                         onClick = { showClearQueueDialog = false }
                     ) {
-                        Text(stringResource(R.string.cancel))
+                        Text(stringResource(R.string.cancel), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             )
@@ -1183,6 +1233,7 @@ private fun QueueHeaderSection(
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     colorScheme: ColorScheme? = null,
+    onLocateCurrentSong: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val colors = MaterialTheme.colorScheme
@@ -1211,7 +1262,8 @@ private fun QueueHeaderSection(
             QueueHeader(
                 queueSourceName = queueSourceName,
                 queueCount = queueCount,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                onLocateCurrentSong = onLocateCurrentSong
             )
         }
     }
@@ -1221,8 +1273,12 @@ private fun QueueHeaderSection(
 private fun QueueHeader(
     queueSourceName: String,
     queueCount: Int,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onLocateCurrentSong: () -> Unit = {}
 ) {
+    val view = LocalView.current
+    val appHapticsConfig = LocalAppHapticsConfig.current
+
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -1233,6 +1289,17 @@ private fun QueueHeader(
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Text(
+                modifier = Modifier.clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() }
+                ) {
+                    performAppCompatHapticFeedback(
+                        view,
+                        appHapticsConfig,
+                        HapticFeedbackConstantsCompat.GESTURE_START
+                    )
+                    onLocateCurrentSong()
+                },
                 text = stringResource(R.string.presentation_batch_e_next_up),
                 style = MaterialTheme.typography.headlineLarge.copy(
                     fontFamily = GoogleSansRounded,

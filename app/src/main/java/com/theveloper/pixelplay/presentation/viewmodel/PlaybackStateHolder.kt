@@ -41,6 +41,12 @@ class PlaybackStateHolder @Inject constructor(
     companion object {
         private const val TAG = "PlaybackStateHolder"
         private const val DURATION_MISMATCH_TOLERANCE_MS = 1500L
+        // Cap how long we trust a pending seek override against an out-of-date player position.
+        // The override exists to mask the few ticks between seekTo() and the player actually
+        // reporting the new position. If we never see drift converge within this window we
+        // assume the seek will not land and fall back to the reported position rather than
+        // pinning the UI on a stale value forever.
+        private const val PAUSED_OVERRIDE_MAX_AGE_MS = 4_000L
         // 250 ms keeps the slider/time display visibly smooth. We tried 500 ms to lower
         // Compose recomposition pressure, but the smooth-progress sampler does not actually
         // interpolate between source samples — it polls — so a 500 ms source cadence made the
@@ -62,6 +68,7 @@ class PlaybackStateHolder @Inject constructor(
     // MediaController
     var mediaController: MediaController? = null
         private set
+    private val mediaControllerStack = mutableListOf<MediaController>()
 
     // Player State
     private val _stablePlayerState = MutableStateFlow(StablePlayerState())
@@ -78,6 +85,7 @@ class PlaybackStateHolder @Inject constructor(
     private var pausedPositionOverrideMediaId: String? = null
     private var pausedPositionOverrideToken: Long? = null
     private var pausedPositionOverrideMs: Long? = null
+    private var pausedPositionOverrideSetAtMs: Long = 0L
     private var coldStartSnapshotMediaId: String? = null
     private var coldStartSnapshotToken: Long? = null
     private var coldStartSnapshotPositionMs: Long? = null
@@ -151,7 +159,33 @@ class PlaybackStateHolder @Inject constructor(
     }
 
     fun setMediaController(controller: MediaController?) {
-        this.mediaController = controller
+        if (controller == null) {
+            mediaControllerStack.clear()
+            mediaController = null
+            return
+        }
+
+        mediaControllerStack.removeAll { it === controller }
+        mediaControllerStack.add(controller)
+        mediaController = controller
+    }
+
+    fun clearMediaController(controller: MediaController?) {
+        if (controller == null) return
+
+        mediaControllerStack.removeAll { it === controller }
+        if (mediaController === controller) {
+            mediaController = mediaControllerStack.lastOrNull()
+        }
+    }
+
+    private fun activeLocalPlayer(): Player {
+        val controller = mediaController
+        return if (controller?.isConnected == true) {
+            controller
+        } else {
+            dualPlayerEngine.masterPlayer
+        }
     }
     
     fun updateStablePlayerState(update: (StablePlayerState) -> StablePlayerState) {
@@ -191,6 +225,7 @@ class PlaybackStateHolder @Inject constructor(
         pausedPositionOverrideMediaId = safeMediaId
         pausedPositionOverrideToken = activeToken
         pausedPositionOverrideMs = safePosition
+        pausedPositionOverrideSetAtMs = SystemClock.elapsedRealtime()
         _currentPosition.value = safePosition
     }
 
@@ -199,6 +234,7 @@ class PlaybackStateHolder @Inject constructor(
             pausedPositionOverrideMediaId = null
             pausedPositionOverrideToken = null
             pausedPositionOverrideMs = null
+            pausedPositionOverrideSetAtMs = 0L
         }
         if (mediaId == null || coldStartSnapshotMediaId == mediaId) {
             clearColdStartSnapshot()
@@ -236,11 +272,29 @@ class PlaybackStateHolder @Inject constructor(
         }
 
         val drift = abs(safeReportedPosition - preferredPosition)
-        if (drift <= DURATION_MISMATCH_TOLERANCE_MS || safeReportedPosition >= preferredPosition) {
-            if (pausedPositionOverrideMediaId == safeMediaId && pausedPositionOverrideToken == activeToken) {
+        val pausedOverrideOwnsThisToken =
+            pausedPositionOverrideMediaId == safeMediaId &&
+                pausedPositionOverrideToken == activeToken
+        val pausedOverrideActive = pausedOverride != null
+        // Stale override fallback: if the player never converges on a freshly-issued seek
+        // we don't want to pin the UI on the requested position forever. After this window
+        // we trust the reported position again.
+        val overrideIsStale = pausedOverrideActive &&
+            pausedPositionOverrideSetAtMs > 0L &&
+            SystemClock.elapsedRealtime() - pausedPositionOverrideSetAtMs > PAUSED_OVERRIDE_MAX_AGE_MS
+        // The `reported >= preferred` shortcut is only safe for the cold-start seed (where
+        // preferred represents "where playback should start" and the player passing it means
+        // the seed has served its purpose). Applying the same shortcut to an active paused
+        // override broke backward seeks — the player still reports the pre-seek (larger)
+        // position for a tick or two after seekTo(), wiping the override before the seek
+        // had landed and snapping the UI back to the old position.
+        val coldStartPassed = !pausedOverrideActive && safeReportedPosition >= preferredPosition
+        if (drift <= DURATION_MISMATCH_TOLERANCE_MS || overrideIsStale || coldStartPassed) {
+            if (pausedOverrideOwnsThisToken) {
                 pausedPositionOverrideMediaId = null
                 pausedPositionOverrideToken = null
                 pausedPositionOverrideMs = null
+                pausedPositionOverrideSetAtMs = 0L
             }
             if (coldStartSnapshotMediaId == safeMediaId && coldStartSnapshotToken == activeToken) {
                 clearColdStartSnapshot()
@@ -262,6 +316,7 @@ class PlaybackStateHolder @Inject constructor(
                 pausedPositionOverrideMediaId = null
                 pausedPositionOverrideToken = null
                 pausedPositionOverrideMs = null
+                pausedPositionOverrideSetAtMs = 0L
             }
             return null
         }
@@ -281,6 +336,7 @@ class PlaybackStateHolder @Inject constructor(
         pausedPositionOverrideMediaId = null
         pausedPositionOverrideToken = null
         pausedPositionOverrideMs = null
+        pausedPositionOverrideSetAtMs = 0L
 
         if (coldStartSnapshotToken != null) {
             clearColdStartSnapshot()
@@ -324,10 +380,13 @@ class PlaybackStateHolder @Inject constructor(
                 }
             }
         } else {
-            val controller = mediaController ?: return
+            val controller = activeLocalPlayer()
             if (controller.isPlaying) {
                 controller.pause()
             } else {
+                if (controller.playbackState == Player.STATE_IDLE && controller.mediaItemCount > 0) {
+                    controller.prepare()
+                }
                 controller.play()
             }
         }
@@ -353,9 +412,14 @@ class PlaybackStateHolder @Inject constructor(
             remoteSeekUnlockJob?.cancel()
             castStateHolder.setRemotelySeeking(false)
             val targetPosition = position.coerceAtLeast(0L)
-            val currentMediaId = mediaController?.currentMediaItem?.mediaId
+            val player = activeLocalPlayer()
+            val currentMediaId = player.currentMediaItem?.mediaId
             rememberPausedPositionOverride(currentMediaId, targetPosition)
-            mediaController?.seekTo(targetPosition)
+            // Mark the seek before dispatching so the engine's HAL-reset heuristic does
+            // not misinterpret the resulting STATE_BUFFERING as an audio HAL underflow and
+            // rebuild the players (which would race with the in-flight seek command).
+            dualPlayerEngine.notifyExternalSeekInitiated()
+            player.seekTo(targetPosition)
         }
     }
 
@@ -364,7 +428,7 @@ class PlaybackStateHolder @Inject constructor(
         if (castSession != null && castSession.remoteMediaClient != null) {
             castStateHolder.castPlayer?.previous()
         } else {
-            val controller = mediaController ?: return
+            val controller = activeLocalPlayer()
              if (controller.currentPosition > 10000) { // 10 seconds
                  controller.seekTo(0)
             } else {
@@ -378,7 +442,7 @@ class PlaybackStateHolder @Inject constructor(
         if (castSession != null && castSession.remoteMediaClient != null) {
             castStateHolder.castPlayer?.next()
         } else {
-             mediaController?.seekToNext()
+             activeLocalPlayer().seekToNext()
         }
     }
 
@@ -543,9 +607,8 @@ class PlaybackStateHolder @Inject constructor(
                         }
                     }
                 } else {
-                     val controller = mediaController
-                     // Media3: Check isPlaying or playbackState == READY/BUFFERING
-                     if (controller != null && controller.isPlaying && !isSeeking) {
+                     val controller = activeLocalPlayer()
+                     if (shouldSampleLocalProgress(controller)) {
                          val visibleSong = _stablePlayerState.value.currentSong
                          val currentMediaId = controller.currentMediaItem?.mediaId
                          val hasMediaMismatch = visibleSong?.id != null &&
@@ -587,6 +650,16 @@ class PlaybackStateHolder @Inject constructor(
                 delay(tickMs)
             }
         }
+    }
+
+    private fun shouldSampleLocalProgress(controller: Player): Boolean {
+        if (isSeeking) return false
+        if (controller.mediaItemCount <= 0) return false
+        if (controller.isPlaying) return true
+
+        return controller.playWhenReady &&
+            controller.playbackState != Player.STATE_IDLE &&
+            controller.playbackState != Player.STATE_ENDED
     }
 
     private fun currentProgressTickMs(): Long {

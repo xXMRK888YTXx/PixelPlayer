@@ -163,7 +163,8 @@ object AppModule {
             PixelPlayDatabase.MIGRATION_36_37,
             PixelPlayDatabase.MIGRATION_37_38,
             PixelPlayDatabase.MIGRATION_38_39,
-            PixelPlayDatabase.MIGRATION_39_40
+            PixelPlayDatabase.MIGRATION_39_40,
+            PixelPlayDatabase.MIGRATION_40_41
         )
             .addCallback(PixelPlayDatabase.createRuntimeArtifactsCallback())
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
@@ -417,14 +418,25 @@ object AppModule {
     @Provides
     @Singleton
     fun provideOkHttpClient(): OkHttpClient {
-        val loggingInterceptor = HttpLoggingInterceptor()
-        loggingInterceptor.setLevel(
-            if (BuildConfig.DEBUG) {
-                HttpLoggingInterceptor.Level.BODY
+        val loggingInterceptor = HttpLoggingInterceptor().apply {
+            // HEADERS (not BODY) so we never print response bodies that may contain
+            // cookies, tokens, or third-party API payloads. Headers are still useful
+            // for debugging request paths and status codes.
+            level = if (BuildConfig.DEBUG) {
+                HttpLoggingInterceptor.Level.HEADERS
             } else {
                 HttpLoggingInterceptor.Level.NONE
             }
-        )
+            // Redact every header that can carry a credential or session token.
+            redactHeader("Authorization")
+            redactHeader("Proxy-Authorization")
+            redactHeader("Cookie")
+            redactHeader("Set-Cookie")
+            redactHeader("x-goog-api-key")
+            redactHeader("X-Emby-Token")
+            redactHeader("X-Emby-Authorization")
+            redactHeader("X-MediaBrowser-Token")
+        }
         
         // Connection pool with optimized connections for better performance
         val connectionPool = okhttp3.ConnectionPool(

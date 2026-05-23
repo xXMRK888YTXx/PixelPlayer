@@ -72,7 +72,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import com.theveloper.pixelplay.data.equalizer.EqualizerManager
@@ -184,6 +183,7 @@ class MusicService : MediaLibraryService() {
     private var observedCastSession: CastSession? = null
     private var activeCastStatsOccurrenceId: String? = null
     private var playbackSnapshotPersistJob: Job? = null
+    private var playbackSnapshotUnloadWriteJob: Job? = null
     private var isRestoringPlaybackSnapshot = false
     private var isPlaybackUnloadInProgress = false
     private val audioManager by lazy {
@@ -877,6 +877,7 @@ class MusicService : MediaLibraryService() {
 
     private fun createSleepTimerPendingIntent(): PendingIntent {
         val intent = Intent(this, SleepTimerReceiver::class.java).apply {
+            action = ACTION_SLEEP_TIMER_EXPIRED
             setPackage(packageName)
         }
         return PendingIntent.getBroadcast(
@@ -998,17 +999,40 @@ class MusicService : MediaLibraryService() {
             pendingMediaButtonForegroundStart ||
             (isMediaButtonIntent &&
                 !startedTemporaryForegroundInOnCreate &&
-                !isServiceAlreadyForeground())
+                !isServiceAlreadyForeground()) ||
+            when (intent?.action) {
+                PlayerActions.PLAY_PAUSE,
+                PlayerActions.NEXT,
+                PlayerActions.PREVIOUS,
+                PlayerActions.FAVORITE,
+                PlayerActions.PLAY_FROM_QUEUE,
+                PlayerActions.SHUFFLE,
+                PlayerActions.REPEAT -> true
+                else -> false
+            }
         if (needsTemporaryForeground && !startedTemporaryForegroundInOnCreate) {
             startTemporaryForegroundForCommand()
         }
 
         intent?.action?.let { action ->
-            val player = mediaSession?.player ?: return@let
+            Timber.tag(TAG).d("onStartCommand widget action: %s", action)
+            val player = mediaSession?.player ?: engine.masterPlayer
             when (action) {
-                PlayerActions.PLAY_PAUSE -> player.playWhenReady = !player.playWhenReady
-                PlayerActions.NEXT -> player.seekToNext()
-                PlayerActions.PREVIOUS -> player.seekToPrevious()
+                PlayerActions.PLAY_PAUSE -> {
+                    if (player.playbackState == Player.STATE_IDLE) {
+                        player.prepare()
+                    }
+                    player.playWhenReady = !player.playWhenReady
+                    requestWidgetFullUpdate(force = true)
+                }
+                PlayerActions.NEXT -> {
+                    player.seekToNext()
+                    requestWidgetFullUpdate(force = true)
+                }
+                PlayerActions.PREVIOUS -> {
+                    player.seekToPrevious()
+                    requestWidgetFullUpdate(force = true)
+                }
                 PlayerActions.FAVORITE -> {
                     val songId = player.currentMediaItem?.mediaId
                     if (!songId.isNullOrBlank()) {
@@ -1034,6 +1058,7 @@ class MusicService : MediaLibraryService() {
                                 timeline.getWindow(i, window)
                                 if (window.mediaItem.mediaId.toLongOrNull() == songId) {
                                     player.seekTo(i, C.TIME_UNSET)
+                                    player.prepare()
                                     player.play()
                                     break
                                 }
@@ -1045,6 +1070,10 @@ class MusicService : MediaLibraryService() {
                     val newState = !isManualShuffleEnabled
                     mediaSession?.let { session ->
                         updateManualShuffleState(session, enabled = newState, broadcast = true)
+                    } ?: run {
+                        // Fallback if session not ready
+                        isManualShuffleEnabled = newState
+                        requestWidgetFullUpdate(force = true)
                     }
                 }
                 PlayerActions.REPEAT -> {
@@ -2889,9 +2918,9 @@ class MusicService : MediaLibraryService() {
         endOfTrackTimerSongId = null
 
         if (preservePlaybackSnapshot) {
-            persistPlaybackSnapshotBlocking()
+            persistPlaybackSnapshotOnUnload()
         } else {
-            clearPlaybackSnapshotBlocking()
+            clearPlaybackSnapshotOnUnload()
         }
 
         listeningStatsTracker.finalizeCurrentSession(forceSynchronousPersistence = true)
@@ -2906,22 +2935,23 @@ class MusicService : MediaLibraryService() {
         stopSelf()
     }
 
-    private fun persistPlaybackSnapshotBlocking() {
+    private fun persistPlaybackSnapshotOnUnload() {
         val snapshot = capturePlaybackSnapshotFromPlayer(playWhenReadyOverride = false)
-        writePlaybackSnapshotBlocking(snapshot)
+        writePlaybackSnapshotOnUnload(snapshot)
     }
 
-    private fun clearPlaybackSnapshotBlocking() {
-        writePlaybackSnapshotBlocking(null)
+    private fun clearPlaybackSnapshotOnUnload() {
+        writePlaybackSnapshotOnUnload(null)
     }
 
-    private fun writePlaybackSnapshotBlocking(snapshot: PlaybackQueueSnapshot?) {
-        runCatching {
-            runBlocking(Dispatchers.IO) {
+    private fun writePlaybackSnapshotOnUnload(snapshot: PlaybackQueueSnapshot?) {
+        playbackSnapshotUnloadWriteJob?.cancel()
+        playbackSnapshotUnloadWriteJob = appScope.launch {
+            runCatching {
                 userPreferencesRepository.setPlaybackQueueSnapshot(snapshot)
+            }.onFailure { e ->
+                Timber.tag(TAG).w(e, "Failed to persist playback snapshot during unload")
             }
-        }.onFailure { e ->
-            Timber.tag(TAG).w(e, "Failed to persist playback snapshot during unload")
         }
     }
 

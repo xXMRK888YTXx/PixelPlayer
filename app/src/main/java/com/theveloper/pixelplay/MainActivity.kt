@@ -442,7 +442,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openExternalUrl(url: String) {
-        val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+        // Defense in depth: the announcement URL is fetched from a remote
+        // properties file on GitHub. If that file is ever tampered with, we
+        // must not let it launch arbitrary intents (`intent://...`,
+        // `javascript:`, custom schemes, etc.). Allow only the Play Store host.
+        val parsed = runCatching { url.toUri() }.getOrNull()
+        val scheme = parsed?.scheme?.lowercase()
+        val host = parsed?.host?.lowercase()
+        val isPlayStore = scheme == "https" &&
+            (host == "play.google.com" || host == "market.android.com")
+        if (!isPlayStore) {
+            LogUtils.w(this, "Refusing to open non-Play-Store announcement URL: $url")
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW, parsed)
         try {
             startActivity(intent)
         } catch (_: ActivityNotFoundException) {
@@ -745,7 +758,6 @@ class MainActivity : ComponentActivity() {
                             val intent = Intent(this@MainActivity, com.theveloper.pixelplay.presentation.telegram.auth.TelegramLoginActivity::class.java)
                             startActivity(intent)
                         }
-                        else -> {}
                     }
                 }
         ) {
@@ -767,6 +779,7 @@ class MainActivity : ComponentActivity() {
                             navBarStyle,
                             showPlayerContentArea,
                             playerContentExpansionFraction,
+                            navBarCornerRadius
                         ) {
                             derivedStateOf {
                                 if (navBarStyle == NavBarStyle.FULL_WIDTH) {
@@ -775,7 +788,7 @@ class MainActivity : ComponentActivity() {
 
                                 if (showPlayerContentArea) {
                                     if (playerContentExpansionFraction < 0.2f) {
-                                        lerp(12.dp, 26.dp, (playerContentExpansionFraction / 0.2f).coerceIn(0f, 1f))
+                                        lerp(navBarCornerRadius.dp, 26.dp, (playerContentExpansionFraction / 0.2f).coerceIn(0f, 1f))
                                     } else {
                                         26.dp
                                     }
