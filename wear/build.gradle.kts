@@ -16,6 +16,7 @@ android {
         targetSdk = 37
         versionCode = (project.findProperty("APP_VERSION_CODE") as String).toInt()
         versionName = project.findProperty("APP_VERSION_NAME") as String
+        applicationIdSuffix = "fork.xxmrk888ytxx"
     }
 
     buildTypes {
