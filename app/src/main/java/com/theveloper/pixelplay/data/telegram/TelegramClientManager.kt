@@ -109,8 +109,8 @@ class TelegramClientManager @Inject constructor(
                     true, // useChatInfoDatabase
                     true, // useMessageDatabase
                     false, // useSecretChats
-                    BuildConfig.TELEGRAM_API_ID,
-                    BuildConfig.TELEGRAM_API_HASH,
+                    "BuildConfig.TELEGRAM_API_ID".hashCode(), // Replaced
+                    "BuildConfig.TELEGRAM_API_HASH", //Replaced
                     "en", // systemLanguageCode
                     "PixelPlayer Instance", // deviceModel
                     android.os.Build.VERSION.RELEASE, // systemVersion
